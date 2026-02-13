@@ -1,0 +1,207 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Poly Track Replica - Final Build</title>
+    <style>
+        body { margin: 0; overflow: hidden; background: #33bbee; font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; }
+        #ui {
+            position: absolute;
+            top: 20px;
+            left: 20px;
+            color: white;
+            background: rgba(0, 0, 0, 0.5);
+            padding: 15px;
+            border-radius: 8px;
+            pointer-events: none;
+            border-left: 5px solid #00ff00;
+        }
+        .stat-label { font-size: 12px; color: #aaa; text-transform: uppercase; }
+        .stat-value { font-size: 24px; font-weight: bold; color: #fff; margin-bottom: 10px; }
+        #controls-hint { position: absolute; bottom: 20px; width: 100%; text-align: center; color: white; text-shadow: 1px 1px 2px black; }
+    </style>
+</head>
+<body>
+    <div id="ui">
+        <div class="stat-label">Velocity</div>
+        <div id="speed" class="stat-value">0 km/h</div>
+        <div class="stat-label">Status</div>
+        <div id="status" class="stat-value">GROUNDED</div>
+    </div>
+    <div id="controls-hint">WASD to Drive | AIR: WASD to Pitch/Roll | R to Reset</div>
+
+    <script type="importmap">
+        {
+            "imports": {
+                "three": "https://unpkg.com/three@0.160.0/build/three.module.js",
+                "cannon-es": "https://unpkg.com/cannon-es@0.20.0/dist/cannon-es.js"
+            }
+        }
+    </script>
+
+    <script type="module">
+        import * as THREE from 'three';
+        import * as CANNON from 'cannon-es';
+
+        // --- 1. CORE SETUP ---
+        const scene = new THREE.Scene();
+        scene.background = new THREE.Color(0x33bbee);
+        scene.fog = new THREE.Fog(0x33bbee, 50, 300);
+
+        const camera = new THREE.PerspectiveCamera(75, window.innerWidth / window.innerHeight, 0.1, 1000);
+        const renderer = new THREE.WebGLRenderer({ antialias: true });
+        renderer.setSize(window.innerWidth, window.innerHeight);
+        renderer.shadowMap.enabled = true;
+        document.body.appendChild(renderer.domElement);
+
+        const world = new CANNON.World({ gravity: new CANNON.Vec3(0, -35, 0) });
+
+        // --- 2. LIGHTING ---
+        const ambient = new THREE.AmbientLight(0xffffff, 0.5);
+        scene.add(ambient);
+        const sun = new THREE.DirectionalLight(0xffffff, 1);
+        sun.position.set(50, 100, 50);
+        sun.castShadow = true;
+        scene.add(sun);
+
+        // --- 3. TRACK BUILDER ---
+        const trackMaterial = new THREE.MeshStandardMaterial({ color: 0x252525, flatShading: true });
+        
+        function addTrackSegment(w, h, d, x, y, z, rx=0, ry=0, rz=0) {
+            const mesh = new THREE.Mesh(new THREE.BoxGeometry(w, h, d), trackMaterial);
+            mesh.position.set(x, y, z);
+            mesh.rotation.set(rx, ry, rz);
+            mesh.receiveShadow = true;
+            scene.add(mesh);
+
+            const body = new CANNON.Body({ 
+                mass: 0, 
+                shape: new CANNON.Box(new CANNON.Vec3(w/2, h/2, d/2)) 
+            });
+            body.position.set(x, y, z);
+            body.quaternion.setFromEuler(rx, ry, rz);
+            world.addBody(body);
+        }
+
+        // Layout a more interesting track
+        addTrackSegment(30, 2, 200, 0, -1, 0);          // Start Straight
+        addTrackSegment(30, 2, 100, 0, 10, 140, 0.2);   // Take-off Ramp
+        addTrackSegment(100, 2, 40, 60, -1, 250);       // Landing Pad
+        addTrackSegment(40, 2, 150, 120, 5, 180, 0, 1.5, 0.1); // Banked Turn
+
+        // --- 4. CAR SYSTEM ---
+        const carWidth = 2.4, carHeight = 1.2, carDepth = 4.5;
+        const carMesh = new THREE.Mesh(
+            new THREE.BoxGeometry(carWidth, carHeight, carDepth),
+            new THREE.MeshStandardMaterial({ color: 0x00ff00, flatShading: true })
+        );
+        carMesh.castShadow = true;
+        scene.add(carMesh);
+
+        // Add a "front" indicator to the car
+        const hood = new THREE.Mesh(new THREE.BoxGeometry(2, 0.2, 1), new THREE.MeshStandardMaterial({color:0x000000}));
+        hood.position.set(0, 0.6, -1.5);
+        carMesh.add(hood);
+
+        const carBody = new CANNON.Body({
+            mass: 200,
+            shape: new CANNON.Box(new CANNON.Vec3(carWidth/2, carHeight/2, carDepth/2)),
+            position: new CANNON.Vec3(0, 5, 0),
+            angularDamping: 0.5,
+            linearDamping: 0.1
+        });
+        world.addBody(carBody);
+
+        // --- 5. INPUTS ---
+        const keys = { w:0, s:0, a:0, d:0 };
+        window.addEventListener('keydown', e => { 
+            if(e.key.toLowerCase() in keys) keys[e.key.toLowerCase()] = 1; 
+            if(e.key === 'r') resetCar();
+        });
+        window.addEventListener('keyup', e => { if(e.key.toLowerCase() in keys) keys[e.key.toLowerCase()] = 0; });
+
+        function resetCar() {
+            carBody.position.set(0, 5, 0);
+            carBody.velocity.set(0,0,0);
+            carBody.angularVelocity.set(0,0,0);
+            carBody.quaternion.set(0,0,0,1);
+        }
+
+        // --- 6. GAME LOOP ---
+        let isGrounded = false;
+        const raycastResult = new CANNON.RaycastResult();
+
+        function animate() {
+            requestAnimationFrame(animate);
+            world.fixedStep();
+
+            // Ground Detection (Raycast directly down from car floor)
+            const rayFrom = carBody.position;
+            const downDir = new THREE.Vector3(0, -1, 0).applyQuaternion(carMesh.quaternion);
+            const rayTo = new CANNON.Vec3(
+                rayFrom.x + downDir.x * 2.5,
+                rayFrom.y + downDir.y * 2.5,
+                rayFrom.z + downDir.z * 2.5
+            );
+            isGrounded = world.raycastClosest(rayFrom, rayTo, {}, raycastResult);
+
+            // Local Orientation Vectors
+            const forward = new THREE.Vector3(0, 0, -1).applyQuaternion(carMesh.quaternion);
+            const right = new THREE.Vector3(1, 0, 0).applyQuaternion(carMesh.quaternion);
+            const speed = carBody.velocity.dot(new CANNON.Vec3(forward.x, forward.y, forward.z));
+
+            if (isGrounded) {
+                // DRIVING LOGIC
+                if (keys.w) carBody.applyForce(new CANNON.Vec3(forward.x, forward.y, forward.z).scale(18000), carBody.position);
+                if (keys.s) carBody.applyForce(new CANNON.Vec3(forward.x, forward.y, forward.z).scale(-10000), carBody.position);
+
+                // Arcade Steering
+                carBody.angularVelocity.y = (keys.a - keys.d) * (Math.min(speed, 25) * 0.15);
+
+                // Lateral Grip (Drift Logic)
+                const lateralVel = carBody.velocity.dot(new CANNON.Vec3(right.x, right.y, right.z));
+                const driftFactor = Math.abs(lateralVel) > 5 ? 0.97 : 0.82; 
+                carBody.applyForce(new CANNON.Vec3(right.x, right.y, right.z).scale(-lateralVel * carBody.mass * driftFactor), carBody.position);
+
+                // Downforce
+                carBody.applyForce(new CANNON.Vec3(0, -6000, 0), carBody.position);
+                document.getElementById('status').innerText = Math.abs(lateralVel) > 5 ? "DRIFTING" : "GROUNDED";
+                document.getElementById('status').style.color = "#00ff00";
+            } else {
+                // AIR CONTROL LOGIC (Pitch and Roll)
+                if(keys.w) carBody.angularVelocity.addScaledVector(2, new CANNON.Vec3(right.x, right.y, right.z), carBody.angularVelocity);
+                if(keys.s) carBody.angularVelocity.addScaledVector(-2, new CANNON.Vec3(right.x, right.y, right.z), carBody.angularVelocity);
+                if(keys.a) carBody.angularVelocity.addScaledVector(2, new CANNON.Vec3(forward.x, forward.y, forward.z), carBody.angularVelocity);
+                if(keys.d) carBody.angularVelocity.addScaledVector(-2, new CANNON.Vec3(forward.x, forward.y, forward.z), carBody.angularVelocity);
+
+                document.getElementById('status').innerText = "AIRBORNE";
+                document.getElementById('status').style.color = "#ffae00";
+            }
+
+            // Sync Mesh to Physics
+            carMesh.position.copy(carBody.position);
+            carMesh.quaternion.copy(carBody.quaternion);
+
+            // Camera Logic (Elastic Follow)
+            const camOffset = new THREE.Vector3(0, 6, 15).applyQuaternion(carMesh.quaternion);
+            camera.position.lerp(carMesh.position.clone().add(camOffset), 0.1);
+            camera.lookAt(carMesh.position);
+
+            // UI Refresh
+            document.getElementById('speed').innerText = Math.abs(Math.round(speed * 3.6)) + " km/h";
+            
+            renderer.render(scene, camera);
+        }
+
+        // Handle Resize
+        window.addEventListener('resize', () => {
+            camera.aspect = window.innerWidth / window.innerHeight;
+            camera.updateProjectionMatrix();
+            renderer.setSize(window.innerWidth, window.innerHeight);
+        });
+
+        animate();
+    </script>
+</body>
+</html>
